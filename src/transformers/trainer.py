@@ -982,6 +982,8 @@ class Trainer:
                     "weight_decay": 0.0,
                 },
             ]
+            
+            print(self.model)
 
             optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
 
@@ -992,7 +994,12 @@ class Trainer:
                     **optimizer_kwargs,
                 )
             else:
-                self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
+                print( optimizer_cls.__name__)
+                if optimizer_cls.__name__ == "KFAC":
+                    self.optimizer = optimizer_cls(self.model, **optimizer_kwargs)
+                else:
+                    self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
+
                 if optimizer_cls.__name__ == "Adam8bit":
                     import bitsandbytes
 
@@ -1013,7 +1020,7 @@ class Trainer:
         return self.optimizer
 
     @staticmethod
-    def get_optimizer_cls_and_kwargs(self,args: TrainingArguments) -> Tuple[Any, Any]:
+    def get_optimizer_cls_and_kwargs(args: TrainingArguments) -> Tuple[Any, Any]:
         """
         Returns the optimizer class and optimizer parameters based on the training arguments.
 
@@ -1038,7 +1045,6 @@ class Trainer:
         }
 
         kfac_kwargs = {
-            "model":self.model,
             "damping":args.eva_damping,
             "kl_clip":args.eva_kl_clip,
             "factor_decay":args.eva_factor_decay,

@@ -734,7 +734,7 @@ class Adafactor(Optimizer):
 class KFAC(Optimizer):
     """Accelerate Distributed K-FAC with Sublinear Memory Cost
     Args:
-      model (nn): Torch model
+      training_model (nn): Torch model
       lr (float): learning rate (default: 0.1)
       damping (float): Tikhonov damping parameter (default: 0.03)
       kl_clip (float): clipping parameter for gradient scaling (kl_clip > 0: kl-clip, kl_clip = 0: re-scale, kl-clip < 0: None)
@@ -745,7 +745,7 @@ class KFAC(Optimizer):
     """
     def __init__(self,
                  model,
-                 lr=0.1,
+                 lr=1e-5,
                  damping=0.03,
                  fac_update_freq=1,
                  kfac_update_freq=1,
@@ -771,6 +771,14 @@ class KFAC(Optimizer):
         self.exclude_vocabulary_size = exclude_vocabulary_size
         self.hook_enabled = hook_enabled
         
+        # generate backend (Torch)
+        try:
+            print(f"world size:{torch.distributed.get_world_size()}")
+        except:
+            return RuntimeError('Torch.distributed much be init before create TorchBackend.')
+        
+        self.backend=_TorchBackend()
+        print(self.backend)
         # register hooks
         self.modules = []
         self.module_names = []
@@ -784,12 +792,7 @@ class KFAC(Optimizer):
         self.module_ranks = None
 
         self.steps = 0
-        try:
-            torch.distributed.get_world_size()
-        except:
-            return RuntimeError('Torch.distributed much be init before create TorchBackend.')
-        
-        self.backend=_TorchBackend()
+
         
     ### Register hooks
     def set_hook_enabled(self, mode=True):
@@ -831,16 +834,22 @@ class KFAC(Optimizer):
         name_idx = 0
         for module in model.modules():
             classname = module.__class__.__name__
+            # print(classname)
             if classname in supported_modules:
                 if self.exclude_vocabulary_size is not None and classname == 'Linear' and module.out_features == self.exclude_vocabulary_size:
                     continue # exclude the pre-softmax linear layer in the Transformer model
                 self.modules.append(module)
                 module.register_forward_pre_hook(self._forward_hook_event)
-                module.register_backward_hook(self._backward_hook_event)  # used in pytorch1.4, and pytorch1.8 (full_backward_hook is not fired when its grad_input is None)
+                # module.register_full_forward_hook(self._forward_hook_event)
+                module.register_full_backward_hook(self._backward_hook_event)  # used in pytorch1.4, and pytorch1.8 (full_backward_hook is not fired when its grad_input is None)
                 #module.register_full_backward_hook(self._backward_hook_event)  # used in pytorch1.10
                 module_name = 'module_name_%s_%d' % (classname, name_idx)
                 self.module_names.append(module_name)
                 name_idx += 1
+
+        # if self.backend.rank() == 0:
+        print(self.module_names)
+
         if self.backend.rank() == 0:
             logger.info("#register modules: %s", len(self.modules))
 
@@ -857,6 +866,8 @@ class KFAC(Optimizer):
             mg = self.m_g[module].view(-1, 1)
             grad = self._get_grad(module)
             
+            # print(grad)
+
             #if self.backend.rank() == 0:
             #    logger.info("mg: %s" % (mg))
             
@@ -888,7 +899,9 @@ class KFAC(Optimizer):
                         v_sum += (bias * bias).sum().item()
                         g_sum += (module.weight.grad.data * module.weight.grad.data).sum().item()
                         g_sum += (module.bias.grad.data * module.bias.grad.data).sum().item()
+
                 # copy
+                # print(weight)
                 module.weight.grad.data.copy_(weight)
                 module.bias.grad.data.copy_(bias)
                 del grad
@@ -901,6 +914,7 @@ class KFAC(Optimizer):
                         v_sum += (weight * weight).sum().item()
                         g_sum += (module.weight.grad.data * module.weight.grad.data).sum().item()
                 # copy
+                # print(weight)
                 module.weight.grad.data.copy_(weight)
             del v
 
@@ -910,7 +924,7 @@ class KFAC(Optimizer):
                 nu = min(1.0, math.sqrt(self.kl_clip / vg_sum)) if vg_sum > 0 else 1.0
             else: # re-scale
                 nu = math.sqrt(g_sum / v_sum)
-
+            print(f"nu: {nu}")
             for module in self.modules:
                 module.weight.grad.data.mul_(nu)
                 if module.bias is not None:
@@ -944,7 +958,9 @@ class KFAC(Optimizer):
             for handle in self.handles:
                 self.backend.synchronize(handle)
             self.handles = []
-        
+
+        # print("all synchronized")
+
         self._precondition_grads()
 
         self.steps += 1

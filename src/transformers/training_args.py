@@ -608,19 +608,6 @@ class TrainingArguments:
 
             This flag is experimental and subject to change in future releases.
     """
-    # eva args
-    eva_damping: Optional[float] = field(
-        default=0.03,
-        metadata={"help": ("Tikhonov damping parameter (default: 0.03).")},
-    )
-    eva_kl_clip: Optional[float] = field(
-        default=0.001,
-        metadata={"help": ("clipping parameter for gradient scaling (kl_clip > 0: kl-clip, kl_clip = 0: re-scale, kl-clip < 0: None).")},
-    )
-    eva_factor_decay: Optional[float] = field(
-        default=0.95,
-        metadata={"help": ("running average coefficient for KVs.")},
-    )
 
     framework = "pt"
     output_dir: str = field(
@@ -691,6 +678,20 @@ class TrainingArguments:
                 " evaluation_strategy."
             )
         },
+    )
+    
+    # eva args
+    eva_damping: Optional[float] = field(
+        default=0.03,
+        metadata={"help": ("Tikhonov damping parameter (default: 0.03).")},
+    )
+    eva_kl_clip: Optional[float] = field(
+        default=0.001,
+        metadata={"help": ("clipping parameter for gradient scaling (kl_clip > 0: kl-clip, kl_clip = 0: re-scale, kl-clip < 0: None).")},
+    )
+    eva_factor_decay: Optional[float] = field(
+        default=0.95,
+        metadata={"help": ("running average coefficient for KVs.")},
     )
 
     learning_rate: float = field(default=5e-5, metadata={"help": "The initial learning rate for AdamW."})

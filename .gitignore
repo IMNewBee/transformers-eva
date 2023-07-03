@@ -167,3 +167,5 @@ tags
 
 # ruff
 .ruff_cache
+
+/examples/pytorch/text-classification/output
