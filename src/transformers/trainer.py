@@ -1013,7 +1013,7 @@ class Trainer:
         return self.optimizer
 
     @staticmethod
-    def get_optimizer_cls_and_kwargs(args: TrainingArguments) -> Tuple[Any, Any]:
+    def get_optimizer_cls_and_kwargs(self,args: TrainingArguments) -> Tuple[Any, Any]:
         """
         Returns the optimizer class and optimizer parameters based on the training arguments.
 
@@ -1036,6 +1036,13 @@ class Trainer:
             "betas": (args.adam_beta1, args.adam_beta2),
             "eps": args.adam_epsilon,
         }
+
+        kfac_kwargs = {
+            "model":self.model,
+            "damping":args.eva_damping,
+            "kl_clip":args.eva_kl_clip,
+            "factor_decay":args.eva_factor_decay,
+        }
         if args.optim == OptimizerNames.ADAFACTOR:
             optimizer_cls = Adafactor
             optimizer_kwargs.update({"scale_parameter": False, "relative_step": False})
@@ -1044,6 +1051,11 @@ class Trainer:
 
             optimizer_cls = AdamW
             optimizer_kwargs.update(adam_kwargs)
+        elif args.optim == OptimizerNames.KFAC:
+            from .optimization import KFAC
+
+            optimizer_cls = KFAC
+            optimizer_kwargs.update(kfac_kwargs)
         elif args.optim in [OptimizerNames.ADAMW_TORCH, OptimizerNames.ADAMW_TORCH_FUSED]:
             from torch.optim import AdamW
 

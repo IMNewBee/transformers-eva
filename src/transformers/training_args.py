@@ -150,7 +150,7 @@ class OptimizerNames(ExplicitEnum):
     PAGED_ADAMW_8BIT = "paged_adamw_8bit"
     PAGED_LION = "paged_lion_32bit"
     PAGED_LION_8BIT = "paged_lion_8bit"
-
+    KFAC = "eva"
 
 @dataclass
 class TrainingArguments:
@@ -608,6 +608,19 @@ class TrainingArguments:
 
             This flag is experimental and subject to change in future releases.
     """
+    # eva args
+    eva_damping: Optional[float] = field(
+        default=0.03,
+        metadata={"help": ("Tikhonov damping parameter (default: 0.03).")},
+    )
+    eva_kl_clip: Optional[float] = field(
+        default=0.001,
+        metadata={"help": ("clipping parameter for gradient scaling (kl_clip > 0: kl-clip, kl_clip = 0: re-scale, kl-clip < 0: None).")},
+    )
+    eva_factor_decay: Optional[float] = field(
+        default=0.95,
+        metadata={"help": ("running average coefficient for KVs.")},
+    )
 
     framework = "pt"
     output_dir: str = field(
