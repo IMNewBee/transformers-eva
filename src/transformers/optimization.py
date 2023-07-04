@@ -731,7 +731,7 @@ class Adafactor(Optimizer):
 
         return loss
 
-class KFAC(Optimizer):
+class KFAC(torch.optim.SGD):
     """Accelerate Distributed K-FAC with Sublinear Memory Cost
     Args:
       training_model (nn): Torch model
@@ -762,8 +762,10 @@ class KFAC(Optimizer):
                         fac_update_freq=fac_update_freq,
                         kfac_update_freq=kfac_update_freq) 
 
-        super(KFAC, self).__init__(model.parameters(), defaults)
-
+        super(KFAC, self).__init__(model.parameters(), lr)
+        self.lr = lr
+        self.damping = damping
+        self.kfac_update_freq = kfac_update_freq
         self.fac_update_freq = fac_update_freq
         self.kfac_batch_size = kfac_batch_size
         self.kl_clip = kl_clip if (kl_clip is not None and kl_clip >= 0) else None
@@ -800,6 +802,7 @@ class KFAC(Optimizer):
 
     def _forward_hook_event(self, module, input):
         """Default: hook for saving input (a)"""
+        # print(len(input))
         if self.hook_enabled and torch.is_grad_enabled() and self.steps % self.fac_update_freq == 0:
             with torch.no_grad():
                 new = get_vector_a(input[0].data[0:self.kfac_batch_size], module)
@@ -924,7 +927,7 @@ class KFAC(Optimizer):
                 nu = min(1.0, math.sqrt(self.kl_clip / vg_sum)) if vg_sum > 0 else 1.0
             else: # re-scale
                 nu = math.sqrt(g_sum / v_sum)
-            print(f"nu: {nu}")
+            # print(f"nu: {nu}")
             for module in self.modules:
                 module.weight.grad.data.mul_(nu)
                 if module.bias is not None:
@@ -948,11 +951,12 @@ class KFAC(Optimizer):
         """Perform one K-FAC step"""
 
         # update params, used for compatibilty with `KFACParamScheduler`
-        group = self.param_groups[0]
-        self.lr = group['lr']
-        self.damping = group['damping']
-        self.fac_update_freq = group['fac_update_freq']
-        self.kfac_update_freq = group['kfac_update_freq']
+        # print(self.param_groups)
+        # group = self.param_groups[0]
+        # self.lr = group['lr']
+        # self.damping = group['damping']
+        # self.fac_update_freq = group['fac_update_freq']
+        # self.kfac_update_freq = group['kfac_update_freq']
 
         if self.steps % self.fac_update_freq == 0 and self.backend.size() > 1:
             for handle in self.handles:
@@ -964,6 +968,7 @@ class KFAC(Optimizer):
         self._precondition_grads()
 
         self.steps += 1
+        super().step()
 
 
 class AdafactorSchedule(LambdaLR):
