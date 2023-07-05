@@ -151,6 +151,7 @@ class OptimizerNames(ExplicitEnum):
     PAGED_LION = "paged_lion_32bit"
     PAGED_LION_8BIT = "paged_lion_8bit"
     KFAC = "eva"
+    ADAMW_ACP = "adamw_acp"
 
 @dataclass
 class TrainingArguments:

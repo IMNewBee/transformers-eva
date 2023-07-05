@@ -28,7 +28,7 @@ from .trainer_utils import SchedulerType
 from .utils import logging
 from .utils.versions import require_version
 
-from .eva_backend import _TorchBackend
+from .eva_backend import _TorchBackend, broadcast_optimizer_state
 from .eva_utils import get_vector_a, get_vector_g
 
 logger = logging.get_logger(__name__)
@@ -489,6 +489,330 @@ class AdamW(Optimizer):
                     p.add_(p, alpha=(-group["lr"] * group["weight_decay"]))
 
         return loss
+
+class DistributedOptimizer(torch.optim.AdamW):
+    def __init__(self, params,lr=0.001,betas: Tuple[float, float] = (0.9, 0.999),eps: float = 1e-6,weight_decay: float = 0.0,named_parameters=None, rank=4, threshold=25):
+        r"""Distributed ACP-SGD optimizer with WFBP and tensor fusion. 
+        Args:
+            params: optimizer parameters. 
+            named_parameters: A mapping between parameter names and values. 
+            rank: rank size for power iteration. 
+            threshold: buffer size threshold (in MB) for tensor fusion.
+        """
+        defaults = {"lr": lr, "betas": betas, "eps": eps, "weight_decay": weight_decay}
+        super(self.__class__, self).__init__(params,defaults)
+        self._rank = rank
+        self._threshold = threshold
+        self._num_steps = 0
+        self._compute_p = True  # compute P or Q
+        self._grad_accs = []
+
+        # parameter names
+        if named_parameters is not None:
+            named_parameters = list(named_parameters)
+            self._param_names = {v: k for k, v in sorted(named_parameters)}
+        else:
+            self._param_names = {v: 'param.noname.%s' % i
+                                     for param_group in self.param_groups
+                                     for i, v in enumerate(param_group['params'])}
+
+        self._register_hooks()
+        self._generate_groups_with_threshold()
+        self._streams = {}
+        
+        # generate backend (Torch)
+        try:
+            print(f"world size:{torch.distributed.get_world_size()}")
+        except:
+            return RuntimeError('Torch.distributed much be init before create TorchBackend.')
+        
+        self.backend=_TorchBackend()
+        print(self.backend)
+
+        if torch.cuda.is_available() and self.backend.size() > 1:
+            # Stream for grad reduction in the backward pass.  
+            self._streams["reduce"] = torch.cuda.Stream()
+
+    def _generate_groups_with_threshold(self):
+        """
+        Generate groups with buffer size threshold (in MB) for tensor fusion. 
+        """
+        p_size = []
+        q_size = []
+        model_size = []
+        self._param_errors = {} # error-feedback for compressed gradients
+        for p in self._register_parameters[::-1]:
+            p_name = self._param_names[p]
+            if p.ndimension() > 1: # compressed tensors
+                M = p.view(p.shape[0], -1)
+                r = min(self._rank, min(M.shape)) # ensure r<=min(n, m)
+                self._param_errors[p_name] = torch.zeros_like(M)
+                p_size.append(M.shape[0] * r * 4/1024/1024) #MB
+                q_size.append(M.shape[1] * r * 4/1024/1024)
+                model_size.append(p.data.numel() * 4/1024/1024)
+            else: # uncompressed tensors
+                p_size.append(p.data.numel() * 4/1024/1024)
+                q_size.append(p.data.numel() * 4/1024/1024)
+                model_size.append(p.data.numel() * 4/1024/1024)
+        if self.backend.rank() == 0: 
+            print('Memory (MB) Grad: %.2f, P: %.2f, Q: %.2f'%(sum(model_size), sum(p_size), sum(q_size))) 
+        
+        # compressed buffer size
+        threshold_p = self._threshold * sum(p_size) / sum(model_size)
+        threshold_q = self._threshold * sum(q_size) / sum(model_size)
+
+        # Generate P Groups e.g. [[p3, p2], [p1]]
+        p_groups = []
+        current_group = []
+        tot_size = 0
+        for i, p in enumerate(self._register_parameters[::-1]):
+            ps = p_size[i]
+            if tot_size == 0 or tot_size + ps <= threshold_p:
+                current_group.append(p)
+                tot_size += ps
+            else:
+                p_groups.append(current_group)
+                current_group = [p]
+                tot_size = ps
+        if len(current_group) > 0:
+            p_groups.append(current_group)
+        self._prepare_tensor_fusion_p(p_groups)
+
+        # Generate Q Groups e.g. [[p3, p2], [p1]]
+        q_groups = []
+        current_group = []
+        tot_size = 0
+        for i, p in enumerate(self._register_parameters[::-1]):
+            qs = q_size[i]
+            if tot_size == 0 or tot_size + qs <= threshold_q:
+                current_group.append(p)
+                tot_size += qs
+            else:
+                q_groups.append(current_group)
+                current_group = [p]
+                tot_size = qs
+        if len(current_group) > 0:
+            q_groups.append(current_group)
+        self._prepare_tensor_fusion_q(q_groups)      
+
+
+    def _prepare_tensor_fusion_p(self, p_groups):
+        """
+        Prepare tensor fusion based on groups. 
+        """
+        self._buffers_p = []            # P buffers
+        self._param_ps = {}             # get P by name
+        self._param_group_idx_p = {}    # get (group id, sub id) by name
+        
+        for group_idx, p_group in enumerate(p_groups):
+            for sub_idx, p in enumerate(p_group):
+                p_name = self._param_names[p]
+                self._param_group_idx_p[p_name] = (group_idx, sub_idx)
+            buffer_p = self._get_buffer_p(p_group)
+            self._buffers_p.append(buffer_p)
+
+        self._param_group_flags_p = [[False]*len(g) for g in p_groups] # check whether param group is ready
+
+        if self.backend.rank() == 0: 
+            print('P Buffer sizes (MB):', 
+                    ', '.join('{:.2f}'.format(buf.numel()*4/1024/1024) for buf in self._buffers_p))
+
+    def _get_buffer_p(self, p_group):
+        # buffer initialization
+        start_p = 0
+        for p in p_group:
+            if p.ndimension() > 1:
+                M = p.view(p.shape[0], -1)
+                r = min(self._rank, min(M.shape))
+                start_p += M.shape[0] * r
+            else:
+                start_p += p.data.numel()
+        buffer_p = torch.randn(start_p, device=p.device) # check: set seed
+
+        # param_ps mapping
+        start_p = 0
+        for p in p_group:
+            p_name = self._param_names[p]
+            if p.ndimension() > 1:
+                M = p.view(p.shape[0], -1)
+                r = min(self._rank, min(M.shape))
+                ps = M.shape[0] * r
+                P = buffer_p[start_p:start_p+ps].view(M.shape[0], r)
+                self._param_ps[p_name] = P
+                start_p += ps
+            else:
+                ps = p.data.numel()
+                P = buffer_p[start_p:start_p+ps].view(p.data.shape)
+                self._param_ps[p_name] = P
+                start_p += ps
+        return buffer_p
+
+    def _prepare_tensor_fusion_q(self, q_groups):
+        """
+        Prepare tensor fusion based on groups. 
+        """
+        self._buffers_q = []            # Q buffers
+        self._param_qs = {}             # get Q by name
+        self._param_group_idx_q = {}    # get (group id, sub id) by name
+        
+        for group_idx, q_group in enumerate(q_groups):
+            for sub_idx, p in enumerate(q_group):
+                p_name = self._param_names[p]
+                self._param_group_idx_q[p_name] = (group_idx, sub_idx)
+            buffer_q = self._get_buffer_q(q_group)
+            self._buffers_q.append(buffer_q)
+
+        self._param_group_flags_q = [[False]*len(g) for g in q_groups] # check whether param group is ready
+
+        if self.backend.rank() == 0: 
+            print('Q Buffer sizes (MB):', 
+                    ', '.join('{:.2f}'.format(buf.numel()*4/1024/1024) for buf in self._buffers_q))
+
+    def _get_buffer_q(self, q_group):
+        # buffer initialization
+        start_p = 0
+        for p in q_group:
+            if p.ndimension() > 1:
+                M = p.view(p.shape[0], -1)
+                r = min(self._rank, min(M.shape))
+                start_p += M.shape[1] * r
+            else:
+                start_p += p.data.numel()
+        buffer_q = torch.randn(start_p, device=p.device) # check: set seed
+
+        # param_ps mapping
+        start_p = 0
+        for p in q_group:
+            p_name = self._param_names[p]
+            if p.ndimension() > 1:
+                M = p.view(p.shape[0], -1)
+                r = min(self._rank, min(M.shape))
+                qs = M.shape[1] * r
+                Q = buffer_q[start_p:start_p+qs].view(M.shape[1], r)
+                self._param_qs[p_name] = Q
+                start_p += qs
+            else:
+                qs = p.data.numel()
+                Q = buffer_q[start_p:start_p+qs].view(p.data.shape)
+                self._param_qs[p_name] = Q
+                start_p += qs
+        return buffer_q
+
+    def _register_hooks(self):
+        """
+        Register hooks. 
+        """
+        self._register_parameters = []
+        for param_group in self.param_groups:
+            for p in param_group['params']:
+                if p.requires_grad:
+                    p.grad = p.data.new(p.size()).zero_()
+                    p_tmp = p.expand_as(p)
+                    grad_acc = p_tmp.grad_fn.next_functions[0][0]
+                    grad_acc.register_hook(self._make_hook(p))
+                    self._grad_accs.append(grad_acc)
+                    self._register_parameters.append(p)
+
+    def _make_hook(self, p):
+        """
+        Add hooks for backward propagation. 
+        """
+        def hook(*ignore):
+            assert not p.grad.requires_grad
+            name = self._param_names.get(p)
+            # get grad, and previous P, Q, Error-feedback
+            tensor = p.grad.data
+            P = self._param_ps.get(name)
+            Q = self._param_qs.get(name)
+            E = self._param_errors.get(name)
+
+            if E is not None: # update compressed tensor in the buffer
+                self._alternative_compress(name, tensor, P, Q, E)
+            else: # update uncompressed tensor in the buffer
+                if self._compute_p:
+                    P.copy_(tensor)
+                else:
+                    Q.copy_(tensor)
+            
+            # check whether buffer is ready to call an all-reduce
+            new_name, buffer = self._buffer_is_ready(name)
+
+            if buffer is not None and self.backend.size() > 1: 
+                self._streams["reduce"].wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(self._streams["reduce"]):
+                    dist.all_reduce(buffer)
+        return hook
+
+    def _alternative_compress(self, name, tensor, P, Q, E):
+        with torch.no_grad():
+            M = tensor.view(tensor.shape[0], -1)
+            if self._compute_p: 
+                Q.copy_(torch.linalg.qr(Q).Q)
+                P.copy_((M + E) @ Q)
+                E.add_(M - P @ Q.T)
+            else:
+                P.copy_(torch.linalg.qr(P).Q)
+                Q.copy_((M + E).T @ P)
+                E.add_(M - P @ Q.T)
+
+    def _buffer_is_ready(self, name):
+        """
+        Check whether buffer is ready to call an all-reduce.
+        """
+        with torch.no_grad():
+            if self._compute_p:
+                group_idx, sub_idx = self._param_group_idx_p[name]
+                self._param_group_flags_p[group_idx][sub_idx] = True
+                for flag in self._param_group_flags_p[group_idx]:
+                    if not flag: # not ready
+                        return name, None
+                buffer = self._buffers_p[group_idx]
+                comm_name = 'reduce-p-group-%d' % group_idx
+                return comm_name, buffer
+            else:
+                group_idx, sub_idx = self._param_group_idx_q[name]
+                self._param_group_flags_q[group_idx][sub_idx] = True
+                for flag in self._param_group_flags_q[group_idx]:
+                    if not flag: # not ready
+                        return name, None
+                buffer = self._buffers_q[group_idx]
+                comm_name = 'reduce-q-group-%d' % group_idx
+                return comm_name, buffer
+
+    def _bp_barrier(self):
+        """
+        Synchronize the all-reduce operations.
+        """
+        if self.backend.size() > 1:
+            torch.cuda.current_stream().wait_stream(self._streams["reduce"])
+
+        # approximate gradient
+        for p in self._register_parameters:
+            if p.ndimension() > 1: 
+                name = self._param_names.get(p)
+                # get P and Q
+                P = self._param_ps.get(name)
+                Q = self._param_qs.get(name)
+                p.grad.data.view(p.grad.shape[0], -1).copy_(P @ Q.T)
+            else:
+                name = self._param_names.get(p)
+                bias = self._param_ps.get(name) if self._compute_p else self._param_qs.get(name)
+                p.grad.data.copy_(bias)
+            p.grad.data.div_(self.backend.size())
+        
+        # clear flags
+        self._param_group_flags_p = [[False]*len(g) for g in self._param_group_flags_p]
+        self._param_group_flags_q = [[False]*len(g) for g in self._param_group_flags_q]
+        self._compute_p = not self._compute_p
+
+
+    def step(self, closure=None): 
+        """
+        Performs a single optimization step.
+        """
+        self._bp_barrier()
+        self._num_steps += 1
+        return super(self.__class__, self).step(closure)
 
 
 class Adafactor(Optimizer):
