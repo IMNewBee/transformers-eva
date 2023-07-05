@@ -1052,12 +1052,12 @@ class Trainer:
         if args.optim == OptimizerNames.ADAFACTOR:
             optimizer_cls = Adafactor
             optimizer_kwargs.update({"scale_parameter": False, "relative_step": False})
-        elif args.optim == OptimizerNames.ADAMW_HF:
+        elif args.optim == OptimizerNames.ADAMW_ACP:
             from .optimization import DistributedOptimizer
 
             optimizer_cls = DistributedOptimizer
             optimizer_kwargs.update(adam_kwargs)
-        elif args.optim == OptimizerNames.ADAMW_ACP:
+        elif args.optim == OptimizerNames.ADAMW_HF:
             from .optimization import AdamW
 
             optimizer_cls = AdamW
