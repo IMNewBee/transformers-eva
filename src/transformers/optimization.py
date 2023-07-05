@@ -500,12 +500,20 @@ class DistributedOptimizer(torch.optim.AdamW):
             threshold: buffer size threshold (in MB) for tensor fusion.
         """
         defaults = {"lr": lr, "betas": betas, "eps": eps, "weight_decay": weight_decay}
-        super(self.__class__, self).__init__(params,defaults)
+        super(self.__class__, self).__init__(params,lr)
         self._rank = rank
         self._threshold = threshold
         self._num_steps = 0
         self._compute_p = True  # compute P or Q
         self._grad_accs = []
+
+        # generate backend (Torch)
+        try:
+            print(f"world size:{torch.distributed.get_world_size()}")
+        except:
+            return RuntimeError('Torch.distributed much be init before create TorchBackend.')
+        
+        self.backend=_TorchBackend()
 
         # parameter names
         if named_parameters is not None:
@@ -515,18 +523,12 @@ class DistributedOptimizer(torch.optim.AdamW):
             self._param_names = {v: 'param.noname.%s' % i
                                      for param_group in self.param_groups
                                      for i, v in enumerate(param_group['params'])}
-
+        # print(self._param_names)
         self._register_hooks()
         self._generate_groups_with_threshold()
         self._streams = {}
         
-        # generate backend (Torch)
-        try:
-            print(f"world size:{torch.distributed.get_world_size()}")
-        except:
-            return RuntimeError('Torch.distributed much be init before create TorchBackend.')
-        
-        self.backend=_TorchBackend()
+
         print(self.backend)
 
         if torch.cuda.is_available() and self.backend.size() > 1:
@@ -706,12 +708,13 @@ class DistributedOptimizer(torch.optim.AdamW):
         for param_group in self.param_groups:
             for p in param_group['params']:
                 if p.requires_grad:
-                    p.grad = p.data.new(p.size()).zero_()
-                    p_tmp = p.expand_as(p)
-                    grad_acc = p_tmp.grad_fn.next_functions[0][0]
-                    grad_acc.register_hook(self._make_hook(p))
-                    self._grad_accs.append(grad_acc)
-                    self._register_parameters.append(p)
+                    if(len(p.shape)==2 and (p.shape[0]+p.shape[1]==1536 or p.shape[0]+p.shape[1]==3840)):
+                        p.grad = p.data.new(p.size()).zero_()
+                        p_tmp = p.expand_as(p)
+                        grad_acc = p_tmp.grad_fn.next_functions[0][0]
+                        grad_acc.register_hook(self._make_hook(p))
+                        self._grad_accs.append(grad_acc)
+                        self._register_parameters.append(p)
 
     def _make_hook(self, p):
         """
@@ -740,17 +743,24 @@ class DistributedOptimizer(torch.optim.AdamW):
             if buffer is not None and self.backend.size() > 1: 
                 self._streams["reduce"].wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(self._streams["reduce"]):
-                    dist.all_reduce(buffer)
+                    self.backend.allreduce(buffer)
         return hook
 
     def _alternative_compress(self, name, tensor, P, Q, E):
         with torch.no_grad():
-            M = tensor.view(tensor.shape[0], -1)
+            if(len(tensor.shape)==1):
+                return
+            # M = tensor.view(tensor.shape[0], -1)
+            M = tensor
             if self._compute_p: 
+                if(Q.shape[0]<Q.shape[1]):
+                    Q=Q.T()
                 Q.copy_(torch.linalg.qr(Q).Q)
                 P.copy_((M + E) @ Q)
                 E.add_(M - P @ Q.T)
             else:
+                if(P.shape[0]<P.shape[1]):
+                    P=P.T()
                 P.copy_(torch.linalg.qr(P).Q)
                 Q.copy_((M + E).T @ P)
                 E.add_(M - P @ Q.T)
