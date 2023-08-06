@@ -972,7 +972,9 @@ class Trainer:
             ]
             
             print(self.model)
-
+            named_parameters={n:p for n, p in opt_model.named_parameters() if (n in decay_parameters and p.requires_grad)}
+            named_parameters.update({n:p for n, p in opt_model.named_parameters() if (n not in decay_parameters and p.requires_grad)})
+            
             optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
 
             if self.sharded_ddp == ShardedDDPOption.SIMPLE:
@@ -985,6 +987,10 @@ class Trainer:
                 print( optimizer_cls.__name__)
                 if optimizer_cls.__name__ == "KFAC":
                     self.optimizer = optimizer_cls(self.model, **optimizer_kwargs)
+                elif optimizer_cls.__name__ == "DistributedOptimizer":
+                    optimizer_kwargs.update({"named_parameters":named_parameters})
+                    self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
+                    pass
                 else:
                     self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
 
@@ -1044,6 +1050,7 @@ class Trainer:
             from .optimization import DistributedOptimizer
 
             optimizer_cls = DistributedOptimizer
+            
             optimizer_kwargs.update(adam_kwargs)
         elif args.optim == OptimizerNames.ADAMW_HF:
             from .optimization import AdamW

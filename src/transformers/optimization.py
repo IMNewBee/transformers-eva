@@ -506,7 +506,7 @@ class DistributedOptimizer(torch.optim.AdamW):
         self._num_steps = 0
         self._compute_p = True  # compute P or Q
         self._grad_accs = []
-
+        self._target_modules=["query","key","value","dense"]
         # generate backend (Torch)
         try:
             print(f"world size:{torch.distributed.get_world_size()}")
@@ -517,24 +517,27 @@ class DistributedOptimizer(torch.optim.AdamW):
 
         # parameter names
         if named_parameters is not None:
-            named_parameters = list(named_parameters)
-            self._param_names = {v: k for k, v in sorted(named_parameters)}
+            self._param_names = {param : name for name,param in named_parameters.items()}
         else:
             self._param_names = {v: 'param.noname.%s' % i
                                      for param_group in self.param_groups
                                      for i, v in enumerate(param_group['params'])}
-        # print(self._param_names)
         self._register_hooks()
         self._generate_groups_with_threshold()
         self._streams = {}
         
-
         print(self.backend)
 
         if torch.cuda.is_available() and self.backend.size() > 1:
             # Stream for grad reduction in the backward pass.  
             self._streams["reduce"] = torch.cuda.Stream()
 
+    def _if_target(self,name):
+        for module in self._target_modules:
+            if(module in name):
+                return True
+        return False
+    
     def _generate_groups_with_threshold(self):
         """
         Generate groups with buffer size threshold (in MB) for tensor fusion. 
@@ -708,7 +711,7 @@ class DistributedOptimizer(torch.optim.AdamW):
         for param_group in self.param_groups:
             for p in param_group['params']:
                 if p.requires_grad:
-                    if(len(p.shape)==2 and (p.shape[0]+p.shape[1]==1536 or p.shape[0]+p.shape[1]==3840)):
+                    if(len(p.shape)==2 and self._if_target(self._param_names[p])):
                         p.grad = p.data.new(p.size()).zero_()
                         p_tmp = p.expand_as(p)
                         grad_acc = p_tmp.grad_fn.next_functions[0][0]
@@ -1183,9 +1186,6 @@ class KFAC(torch.optim.SGD):
                 module_name = 'module_name_%s_%d' % (classname, name_idx)
                 self.module_names.append(module_name)
                 name_idx += 1
-
-        # if self.backend.rank() == 0:
-        print(self.module_names)
 
         if self.backend.rank() == 0:
             logger.info("#register modules: %s", len(self.modules))
